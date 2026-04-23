@@ -1,0 +1,95 @@
+VLSI Architecture — Assignment 2
+RISC-V Debug Module
+Part E: Reflection
+Student: Arpan Jain | 2025ht08066
+================================================
+
+Q1. Why does the spec mandate that dmactive resets everything else?
+
+dmactive acts as a master enable for the entire Debug Module. When a debugger
+first connects — or when a debug session ends — it needs a clean, predictable
+state. If individual registers could persist across sessions, a stale command
+or half-completed abstract operation from a previous session could corrupt a
+new debug session or the hart's architectural state. By tying the reset of all
+DM logic to dmactive=0, the spec guarantees that writing dmactive=0 is a safe,
+atomic "reset all" operation. The JTAG reset also deasserts dmactive, so any
+power-cycle or cable-pull always leaves the DM in a known-safe state. This also
+simplifies verification: you only need to confirm dmactive=0 clears everything,
+rather than checking each register individually.
+
+------------------------------------------------
+
+Q2. What breaks if abstractcs.busy is not set during EXEC?
+
+abstractcs.busy=1 is the "mutex" that prevents the debugger from issuing a
+second command while the first is still executing. If busy is not asserted:
+
+  a) Race condition — the debugger could overwrite the command register or
+     data0 while the FSM is mid-execution, corrupting the ongoing access.
+
+  b) No way to poll completion — the debugger uses `while(busy)` polling to
+     know when it is safe to read data0 for a GPR read result. Without busy
+     being set, it would read data0 before the FSM has written the result.
+
+  c) Incorrect cmderr=1 detection — error code 1 ("busy") is triggered by
+     "command written while busy=1". Without the busy flag the DM has no way
+     to detect this and signal the error correctly.
+
+In short: omitting busy turns the Abstract Command interface into a race
+condition and makes it impossible to reliably read results or detect errors.
+
+------------------------------------------------
+
+Q3. How would you extend this to multi-hart with hartsel?
+
+The dmcontrol register contains a 10-bit hartsel field [15:6] that selects which
+hart is being addressed. To extend the design:
+
+  1. Add a hartsel register (latched from dmcontrol[15:6]).
+  2. Route halt_out, resume_out, and the register-access bus through a demux
+     indexed by hartsel, one set of wires per hart.
+  3. dmstatus.allhalted becomes the AND of all harts' halted signals;
+     anyhalted becomes the OR. Similarly for running.
+  4. The abstract command FSM targets only the selected hart's register bus.
+  5. hawindow / hawindowsel registers allow mass operations across hart sets.
+
+The key design challenge is the dmstatus aggregation logic and ensuring the
+abstract command only fires toward the selected hart even if multiple harts
+are halted simultaneously.
+
+------------------------------------------------
+
+Q4. Why does the spec require halt to win over resume when both are issued together?
+
+Safety. If both haltreq and resumereq arrive in the same cycle (which can
+happen due to debugger software bugs or race conditions in a GUI), silently
+resuming is far more dangerous than silently halting. A halt keeps the hart
+frozen in a known, inspectable state — the worst outcome is the program pauses
+momentarily. A spurious resume could cause the hart to execute code from an
+inconsistent state (registers partially modified, breakpoints not re-armed),
+potentially corrupting memory or causing a system crash. The spec chooses the
+conservative, recoverable option: halt wins, and the debugger can always
+explicitly resume once it is ready.
+
+------------------------------------------------
+
+Q5. Where is the DMI-to-DM clock domain crossing and how do you cross it safely?
+
+The DMI runs at the JTAG TCK frequency (typically 1–50 MHz), while the DM and
+the hart run at the system clock (e.g., 100–1000 MHz). The crossing point is
+between the JTAG TAP controller (which drives dmi_req_valid/addr/data/op) and
+the dmi_slave module (which runs on the system clock).
+
+Safe crossing techniques:
+  1. Two-flop synchroniser: synchronise dmi_req_valid into the system clock
+     domain using two back-to-back flip-flops to eliminate metastability.
+  2. Req/Ack handshake: after synchronising valid, the DM asserts an
+     acknowledge signal (dmi_req_ready) that is synchronised back into the
+     TCK domain. The JTAG TAP holds its request until the ack is seen.
+  3. Gray-coded FIFO (for pipelined DMI): if back-to-back transactions are
+     needed, a shallow async FIFO with gray-coded read/write pointers can
+     safely pass multiple requests across the boundary.
+
+In our implementation (single-transaction, blocking handshake), the two-flop
+synchroniser + req/ack handshake is sufficient and is the approach used in most
+commercial RISC-V debug TAP implementations.
